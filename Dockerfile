@@ -25,11 +25,11 @@ RUN pip3 install uv
 RUN uv pip install -e . --system
 
 # Add user to container
-USER $USERNAME
 RUN groupadd -f $USERNAME || true
 RUN useradd -m -g $USERNAME $USERNAME || useradd -m $USERNAME
 RUN chown -R $USERNAME:$USERNAME /app
 RUN mkdir -p /app/cache
+USER $USERNAME
 
 ENV HF_HUB_CACHE="/app/cache"
 ENV HF_HOME="/app/cache"
