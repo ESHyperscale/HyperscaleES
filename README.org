@@ -1,8 +1,10 @@
 * HyperscaleES
 
+[[https://colab.research.google.com/github/ESHyperscale/HyperscaleES/blob/main/eggroll.ipynb][https://colab.research.google.com/assets/colab-badge.svg]]
+
 Doing evolutionary strategies at the hyperscale.
 
-WARNING: This codebase is a research preview. We strongly recommend reading through the entire src directory and the example in tests/end_to_end_test.py to understand the codebase. We recommend also looking at the [[https://github.com/ESHyperscale/nano-egg][nano-egg]] repository, which contains a single-file implementation of int8 pretraining of a language model from scratch.
+WARNING: This codebase is a research preview. We strongly recommend reading through and running the eggroll.ipynb notebook in colab or locally (cpu/GPU) to understand the core ideas of the codebase, and also checking the example in tests/end_to_end_test.py to understand the codebase. We recommend also looking at the [[https://github.com/ESHyperscale/nano-egg][nano-egg]] repository, which contains a single-file implementation of int8 pretraining of a language model from scratch.
 
 ** Install Instructions
 
@@ -36,7 +38,7 @@ To run the LLM experiments, run the following program. You can check the file fo
 
 ** Core Ideas
 
-The two core components of the codebase are the Noiser (src/hyperscalees/noiser) and the Model (src/hyperscalees/models).
+The two core components of the codebase are the Noiser (src/hyperscalees/noiser) and the Model (src/hyperscalees/models). We strongly recommend reading and running the [[https://colab.research.google.com/github/ESHyperscale/HyperscaleES/blob/main/eggroll.ipynb][eggroll.ipynb]] notebook to see the full implementation and worked out example.
 
 *** Noiser
 
