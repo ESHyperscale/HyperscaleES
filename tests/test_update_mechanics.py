@@ -136,6 +136,7 @@ class TestUpdateMechanics:
         On a simple optimization problem, updates should improve fitness.
         
         This is an integration test: train a tiny MLP to output 2.0.
+        We use a larger population and more epochs to ensure convergence.
         """
         # Setup
         in_dim, out_dim = 4, 1
@@ -151,21 +152,27 @@ class TestUpdateMechanics:
         
         es_tree_key = simple_es_tree_key(params, es_key, scan_map)
         frozen_noiser_params, noiser_params = EggRoll.init_noiser(
-            params, sigma=0.1, lr=0.05, solver=optax.adamw, rank=4
+            params, sigma=0.05, lr=0.1, solver=optax.adam, rank=4
         )
         
         # Fitness function: minimize distance from 2.0
         def compute_fitness(output):
             return -((output - 2.0) ** 2).mean()
         
-        num_envs = 32
-        num_epochs = 10
+        num_envs = 64
+        num_epochs = 50
         
         # Fixed input for consistency
         test_input = jax.random.normal(jax.random.key(999), (num_envs, in_dim))
         
-        initial_fitness = None
-        final_fitness = None
+        # Evaluate initial fitness (without noise)
+        initial_output = jax.vmap(
+            lambda x: MLP.forward(
+                EggRoll, frozen_noiser_params, noiser_params,
+                frozen_params, params, es_tree_key, None, x
+            )
+        )(test_input)
+        initial_fitness = float(compute_fitness(initial_output))
         
         for epoch in range(num_epochs):
             iterinfos = make_iterinfo(num_envs, epoch)
@@ -184,16 +191,13 @@ class TestUpdateMechanics:
             
             raw_fitnesses = jax.vmap(compute_fitness)(outputs)
             
-            if epoch == 0:
-                initial_fitness = float(jnp.mean(raw_fitnesses))
-            
             normalized = EggRoll.convert_fitnesses(frozen_noiser_params, noiser_params, raw_fitnesses)
             noiser_params, params = EggRoll.do_updates(
                 frozen_noiser_params, noiser_params,
                 params, es_tree_key, normalized, iterinfos, es_map
             )
         
-        # Evaluate final fitness
+        # Evaluate final fitness (without noise)
         outputs_final = jax.vmap(
             lambda x: MLP.forward(
                 EggRoll, frozen_noiser_params, noiser_params,
@@ -211,7 +215,7 @@ class TestUpdateMechanics:
         
         This is important for optimizers with momentum (Adam, etc.).
         """
-        frozen_noiser_params, noiser_params_initial = EggRoll.init_noiser(
+        frozen_noiser_params, noiser_params = EggRoll.init_noiser(
             {"w": small_param},
             eggroll_config["sigma"],
             eggroll_config["lr"],
@@ -219,28 +223,40 @@ class TestUpdateMechanics:
             rank=eggroll_config["rank"],
         )
         
+        # Store initial optimizer state for comparison
+        # For Adam, the state contains (count, mu, nu) - we'll check that count increments
+        initial_opt_state = noiser_params["opt_state"]
+        
         num_envs = 8
         iterinfos = make_iterinfo(num_envs)
         fitnesses = jnp.array([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])
-        normalized = EggRoll.convert_fitnesses(frozen_noiser_params, noiser_params_initial, fitnesses)
+        normalized = EggRoll.convert_fitnesses(frozen_noiser_params, noiser_params, fitnesses)
         
         es_tree_key = {"w": es_key}
         es_map = {"w": MM_PARAM}
         
-        noiser_params_after, _ = EggRoll.do_updates(
-            frozen_noiser_params, noiser_params_initial,
+        noiser_params_after, new_params = EggRoll.do_updates(
+            frozen_noiser_params, noiser_params,
             {"w": small_param}, es_tree_key,
             normalized, iterinfos, es_map
         )
         
-        # Optimizer state should have changed
-        # For Adam, the mu and nu terms should be non-zero after first update
-        initial_state = noiser_params_initial["opt_state"]
-        after_state = noiser_params_after["opt_state"]
+        after_opt_state = noiser_params_after["opt_state"]
         
-        # The state structure depends on optax, but they should be different
-        assert noiser_params_after is not noiser_params_initial, \
-            "Noiser params should be a new dict"
+        # The optimizer state should have been updated
+        # For most optax optimizers, there's a step count or moment estimates that change
+        # We can flatten and compare the pytrees
+        initial_flat = jax.tree_util.tree_leaves(initial_opt_state)
+        after_flat = jax.tree_util.tree_leaves(after_opt_state)
+        
+        # At least one leaf should be different after an update
+        any_changed = any(
+            not jnp.allclose(i, a) 
+            for i, a in zip(initial_flat, after_flat)
+            if hasattr(i, 'shape')  # Only compare arrays
+        )
+        
+        assert any_changed, "Optimizer state should change after update"
 
     def test_frozen_nonlora_skips_bias_updates(self, small_param, es_key):
         """

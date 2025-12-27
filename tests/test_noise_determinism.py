@@ -54,15 +54,19 @@ class TestNoiseDeterminism:
         assert jnp.allclose(A1, A2), "Same inputs should produce identical A"
         assert jnp.allclose(B1, B2), "Same inputs should produce identical B"
 
-    def test_different_epochs_produce_different_noise(self, small_param, es_key, eggroll_config):
+    def test_different_epochs_produce_different_noise_when_noise_reuse_nonzero(self, small_param, es_key, eggroll_config):
         """
-        Different epochs produce different perturbations (when noise_reuse=0).
+        Different epoch groups produce different perturbations when noise_reuse > 0.
         
-        This allows the algorithm to explore different directions over time.
+        CODE: true_epoch = 0 if noise_reuse == 0 else epoch // noise_reuse
+        
+        When noise_reuse=0, true_epoch is always 0 (same noise every epoch).
+        When noise_reuse=N, noise changes every N epochs.
         """
+        # With noise_reuse=2, epochs 0,1 share noise, epochs 2,3 share different noise
         frozen_noiser_params = {
             "rank": eggroll_config["rank"],
-            "noise_reuse": 0,
+            "noise_reuse": 2,
         }
         thread_id = 4
         
@@ -90,10 +94,52 @@ class TestNoiseDeterminism:
             es_key
         )
         
-        # All should be different
-        assert not jnp.allclose(B_epoch0, B_epoch1), "Different epochs should have different noise"
-        assert not jnp.allclose(B_epoch1, B_epoch2), "Different epochs should have different noise"
-        assert not jnp.allclose(B_epoch0, B_epoch2), "Different epochs should have different noise"
+        # Epochs 0 and 1 should have SAME noise (same true_epoch = 0)
+        assert jnp.allclose(B_epoch0, B_epoch1), "Epochs 0,1 should share noise with noise_reuse=2"
+        
+        # Epoch 2 should have DIFFERENT noise (true_epoch = 1)
+        assert not jnp.allclose(B_epoch0, B_epoch2), "Epoch 2 should have different noise than epoch 0"
+
+    def test_noise_reuse_zero_means_same_noise_every_epoch(self, small_param, es_key, eggroll_config):
+        """
+        When noise_reuse=0, the same noise is used for all epochs.
+        
+        CODE: true_epoch = 0 if noise_reuse == 0 else epoch // noise_reuse
+        This means true_epoch is always 0 when noise_reuse == 0.
+        """
+        frozen_noiser_params = {
+            "rank": eggroll_config["rank"],
+            "noise_reuse": 0,
+        }
+        thread_id = 4
+        
+        _, B_epoch0 = get_lora_update_params(
+            frozen_noiser_params,
+            eggroll_config["sigma"],
+            (0, thread_id),
+            small_param,
+            es_key
+        )
+        
+        _, B_epoch5 = get_lora_update_params(
+            frozen_noiser_params,
+            eggroll_config["sigma"],
+            (5, thread_id),
+            small_param,
+            es_key
+        )
+        
+        _, B_epoch100 = get_lora_update_params(
+            frozen_noiser_params,
+            eggroll_config["sigma"],
+            (100, thread_id),
+            small_param,
+            es_key
+        )
+        
+        # All epochs should have the same noise when noise_reuse=0
+        assert jnp.allclose(B_epoch0, B_epoch5), "noise_reuse=0 means same noise across epochs"
+        assert jnp.allclose(B_epoch0, B_epoch100), "noise_reuse=0 means same noise across epochs"
 
     def test_noise_reuse_repeats_noise_across_epochs(self, small_param, es_key, eggroll_config):
         """

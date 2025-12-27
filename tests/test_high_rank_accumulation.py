@@ -43,10 +43,10 @@ class TestHighRankAccumulation:
         for thread_id in range(0, num_perturbations * 2, 2):  # Even threads only
             A, B = get_lora_update_params(
                 frozen_noiser_params,
-                sigma=0.1,
-                iterinfo=(0, thread_id),
-                param=medium_param,
-                key=es_key
+                0.1,  # base_sigma
+                (0, thread_id),  # iterinfo
+                medium_param,
+                es_key
             )
             total_perturbation += A @ B.T
         
@@ -76,10 +76,10 @@ class TestHighRankAccumulation:
             for thread_id in range(0, num_perturbations * 2, 2):
                 A, B = get_lora_update_params(
                     frozen_noiser_params,
-                    sigma=0.1,
-                    iterinfo=(0, thread_id),
-                    param=medium_param,
-                    key=es_key
+                    0.1,  # base_sigma
+                    (0, thread_id),  # iterinfo
+                    medium_param,
+                    es_key
                 )
                 total_perturbation += A @ B.T
             
@@ -111,10 +111,10 @@ class TestHighRankAccumulation:
             for thread_id in range(0, num_perturbations * 2, 2):
                 A, B = get_lora_update_params(
                     frozen_noiser_params,
-                    sigma=0.1,
-                    iterinfo=(0, thread_id),
-                    param=medium_param,
-                    key=es_key
+                    0.1,  # base_sigma
+                    (0, thread_id),  # iterinfo
+                    medium_param,
+                    es_key
                 )
                 total_perturbation += A @ B.T
             
@@ -146,10 +146,10 @@ class TestHighRankAccumulation:
         for thread_id in range(0, num_perturbations * 2, 2):
             A, B = get_lora_update_params(
                 frozen_noiser_params,
-                sigma=0.1,
-                iterinfo=(0, thread_id),
-                param=small_param,
-                key=es_key
+                0.1,  # base_sigma
+                (0, thread_id),  # iterinfo
+                small_param,
+                es_key
             )
             total_perturbation += A @ B.T
         
@@ -245,10 +245,10 @@ class TestHighRankAccumulation:
             thread_id = i
             A, B = get_lora_update_params(
                 frozen_noiser_params,
-                sigma=0.1,
-                iterinfo=(0, thread_id),
-                param=large_param,
-                key=es_key
+                0.1,  # base_sigma
+                (0, thread_id),  # iterinfo
+                large_param,
+                es_key
             )
             total_perturbation += weights[i] * (A @ B.T)
         
