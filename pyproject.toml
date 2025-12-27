@@ -57,5 +57,6 @@ dependencies = [
     "reasoning-gym",
     "transformers",
     "math-verify",
-    "antlr4-python3-runtime==4.9.*", 
+    "antlr4-python3-runtime==4.9.*",
+    "pytest",
 ]
