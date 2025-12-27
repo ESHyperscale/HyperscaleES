@@ -10,8 +10,8 @@ This test suite verifies the fundamental claims made in the paper and documents 
 
 ```bash
 # From the HyperscaleES directory
-pip install pytest
-pytest -v
+uv sync
+pytest ./tests -vs
 
 # Run a specific concept
 pytest tests/test_low_rank_structure.py -v
