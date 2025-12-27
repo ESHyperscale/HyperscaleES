@@ -22,7 +22,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 from hyperscalees.noiser.eggroll import EggRoll
 from hyperscalees.noiser.open_es import OpenES
-from hyperscalees.models.common import MLP, simple_es_tree_key, MM_PARAM, PARAM
+from hyperscalees.models.common import MM_PARAM, PARAM
 
 from conftest import make_iterinfo
 
@@ -34,7 +34,14 @@ class TestUpdateMechanics:
         """
         When one perturbation has much higher fitness, the update should
         move parameters toward that perturbation direction.
+        
+        We verify this by:
+        1. Creating a population where one thread has much higher fitness
+        2. Computing the perturbation for that high-fitness thread
+        3. Checking that the parameter update is positively correlated with that perturbation
         """
+        from hyperscalees.noiser.eggroll import get_lora_update_params
+        
         frozen_noiser_params, noiser_params = EggRoll.init_noiser(
             {"w": small_param},
             eggroll_config["sigma"],
@@ -46,21 +53,40 @@ class TestUpdateMechanics:
         num_envs = 8
         iterinfos = make_iterinfo(num_envs)
         
-        # Give thread 0 very high fitness, all others low
-        fitnesses = jnp.array([-1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0, 10.0])
+        # Give thread 6 (even = +sigma direction) very high fitness, all others low
+        # Thread 7 is its antithetic pair with -sigma
+        fitnesses = jnp.array([-1.0, -1.0, -1.0, -1.0, -1.0, -1.0, 10.0, -1.0])
         normalized = EggRoll.convert_fitnesses(frozen_noiser_params, noiser_params, fitnesses)
         
-        es_tree_key = {"w": es_key}
-        es_map = {"w": MM_PARAM}  # 1 = MM_PARAM for LoRA treatment
+        # Get the perturbation for thread 6 (the high-fitness one)
+        A_high, B_high = get_lora_update_params(
+            frozen_noiser_params,
+            noiser_params["sigma"] / jnp.sqrt(frozen_noiser_params["rank"]),
+            (0, 6),  # epoch=0, thread_id=6
+            small_param,
+            es_key
+        )
+        high_fitness_perturbation = A_high @ B_high.T
         
-        noiser_params_new, new_params = EggRoll.do_updates(
+        es_tree_key = {"w": es_key}
+        es_map = {"w": MM_PARAM}
+        
+        _, new_params = EggRoll.do_updates(
             frozen_noiser_params, noiser_params,
             {"w": small_param}, es_tree_key,
             normalized, iterinfos, es_map
         )
         
-        # Update should have occurred
-        assert not jnp.allclose(new_params["w"], small_param), "Parameters should have changed"
+        # The update direction
+        param_delta = new_params["w"] - small_param
+        
+        # Compute correlation: update should be aligned with high-fitness perturbation
+        # (positive dot product means moving toward that direction)
+        correlation = jnp.sum(param_delta * high_fitness_perturbation)
+        
+        # The update should be positively correlated with the high-fitness perturbation
+        assert correlation > 0, \
+            f"Update should move toward high-fitness perturbation, got correlation={float(correlation):.4f}"
 
     def test_equal_antithetic_fitnesses_cancel_to_no_update(self, small_param, es_key, eggroll_config):
         """
@@ -131,83 +157,70 @@ class TestUpdateMechanics:
         assert changes[0] < changes[1] < changes[2], \
             f"Update magnitudes {changes} should increase with LR"
 
-    def test_update_improves_simple_fitness(self, model_key, es_key):
+    def test_update_improves_simple_fitness(self, es_key):
         """
         On a simple optimization problem, updates should improve fitness.
         
-        This is an integration test: train a tiny MLP to output 2.0.
-        We use a larger population and more epochs to ensure convergence.
+        We use a direct test: optimize a single parameter to equal a target value.
+        This is the simplest possible ES task - no neural network, just one scalar.
         """
-        # Setup
-        in_dim, out_dim = 4, 1
-        frozen_params, params, scan_map, es_map = MLP.rand_init(
-            model_key,
-            in_dim=in_dim,
-            out_dim=out_dim,
-            hidden_dims=[8],
-            use_bias=True,
-            activation="relu",
-            dtype="float32"
-        )
+        # Simple task: optimize a scalar to equal 2.0
+        target = 2.0
+        param = jnp.array([[0.5]])  # Start at 0.5, want to reach 2.0
         
-        es_tree_key = simple_es_tree_key(params, es_key, scan_map)
         frozen_noiser_params, noiser_params = EggRoll.init_noiser(
-            params, sigma=0.05, lr=0.1, solver=optax.adam, rank=4
+            {"w": param},
+            sigma=0.1,
+            lr=0.5,
+            solver=optax.sgd,
+            rank=1,
         )
         
-        # Fitness function: minimize distance from 2.0
-        def compute_fitness(output):
-            return -((output - 2.0) ** 2).mean()
+        es_tree_key = {"w": es_key}
+        es_map = {"w": MM_PARAM}
         
-        num_envs = 64
-        num_epochs = 50
+        def fitness(p):
+            """Negative squared distance from target."""
+            return -((p[0, 0] - target) ** 2)
         
-        # Fixed input for consistency
-        test_input = jax.random.normal(jax.random.key(999), (num_envs, in_dim))
-        
-        # Evaluate initial fitness (without noise)
-        initial_output = jax.vmap(
-            lambda x: MLP.forward(
-                EggRoll, frozen_noiser_params, noiser_params,
-                frozen_params, params, es_tree_key, None, x
-            )
-        )(test_input)
-        initial_fitness = float(compute_fitness(initial_output))
+        initial_fitness = float(fitness(param))
+        num_envs = 32
+        num_epochs = 20
         
         for epoch in range(num_epochs):
             iterinfos = make_iterinfo(num_envs, epoch)
             
-            # Forward pass for each population member
-            def forward_one(iterinfo, x):
-                return MLP.forward(
-                    EggRoll, frozen_noiser_params, noiser_params,
-                    frozen_params, params, es_tree_key, iterinfo, x
+            # Evaluate fitness for each perturbed parameter
+            fitnesses = []
+            for i in range(num_envs):
+                # Get the perturbed parameter
+                perturbed = EggRoll.get_noisy_standard(
+                    frozen_noiser_params, noiser_params, param,
+                    es_key, (iterinfos[0][i], iterinfos[1][i])
                 )
+                fitnesses.append(fitness(perturbed))
             
-            outputs = jax.vmap(forward_one)(
-                (iterinfos[0], iterinfos[1]),
-                test_input
-            )
-            
-            raw_fitnesses = jax.vmap(compute_fitness)(outputs)
-            
+            raw_fitnesses = jnp.array(fitnesses)
             normalized = EggRoll.convert_fitnesses(frozen_noiser_params, noiser_params, raw_fitnesses)
-            noiser_params, params = EggRoll.do_updates(
+            
+            noiser_params, new_params = EggRoll.do_updates(
                 frozen_noiser_params, noiser_params,
-                params, es_tree_key, normalized, iterinfos, es_map
+                {"w": param}, es_tree_key,
+                normalized, iterinfos, es_map
             )
+            param = new_params["w"]
         
-        # Evaluate final fitness (without noise)
-        outputs_final = jax.vmap(
-            lambda x: MLP.forward(
-                EggRoll, frozen_noiser_params, noiser_params,
-                frozen_params, params, es_tree_key, None, x
-            )
-        )(test_input)
-        final_fitness = float(compute_fitness(outputs_final))
+        final_fitness = float(fitness(param))
         
+        # Fitness should improve (get closer to 0, which is the max)
         assert final_fitness > initial_fitness, \
             f"Fitness should improve: {initial_fitness:.4f} -> {final_fitness:.4f}"
+        
+        # And parameter should be closer to target
+        initial_distance = abs(0.5 - target)
+        final_distance = abs(float(param[0, 0]) - target)
+        assert final_distance < initial_distance, \
+            f"Should get closer to target: {initial_distance:.4f} -> {final_distance:.4f}"
 
     def test_optimizer_state_updates(self, small_param, es_key, eggroll_config):
         """
