@@ -226,7 +226,10 @@ class TestUpdateMechanics:
         """
         The optimizer state should be updated after do_updates.
         
-        This is important for optimizers with momentum (Adam, etc.).
+        For Adam, this means:
+        1. Step count increments from 0 to 1
+        2. Momentum estimates (mu) are updated
+        3. Second moment estimates (nu) are updated
         """
         frozen_noiser_params, noiser_params = EggRoll.init_noiser(
             {"w": small_param},
@@ -236,9 +239,13 @@ class TestUpdateMechanics:
             rank=eggroll_config["rank"],
         )
         
-        # Store initial optimizer state for comparison
-        # For Adam, the state contains (count, mu, nu) - we'll check that count increments
+        # For optax.adam, the state is typically (ScaleByAdamState(count, mu, nu), EmptyState)
+        # Let's extract the count specifically
         initial_opt_state = noiser_params["opt_state"]
+        
+        # Get initial count - it should be 0
+        initial_count = initial_opt_state[0].count
+        assert int(initial_count) == 0, f"Initial count should be 0, got {initial_count}"
         
         num_envs = 8
         iterinfos = make_iterinfo(num_envs)
@@ -256,20 +263,23 @@ class TestUpdateMechanics:
         
         after_opt_state = noiser_params_after["opt_state"]
         
-        # The optimizer state should have been updated
-        # For most optax optimizers, there's a step count or moment estimates that change
-        # We can flatten and compare the pytrees
-        initial_flat = jax.tree_util.tree_leaves(initial_opt_state)
-        after_flat = jax.tree_util.tree_leaves(after_opt_state)
+        # Count should have incremented to 1
+        after_count = after_opt_state[0].count
+        assert int(after_count) == 1, f"Count should increment to 1, got {after_count}"
         
-        # At least one leaf should be different after an update
-        any_changed = any(
+        # Momentum (mu) should be non-zero now (it accumulates gradients)
+        initial_mu = initial_opt_state[0].mu
+        after_mu = after_opt_state[0].mu
+        
+        # Flatten and check that mu changed
+        initial_mu_flat = jax.tree_util.tree_leaves(initial_mu)
+        after_mu_flat = jax.tree_util.tree_leaves(after_mu)
+        
+        mu_changed = any(
             not jnp.allclose(i, a) 
-            for i, a in zip(initial_flat, after_flat)
-            if hasattr(i, 'shape')  # Only compare arrays
+            for i, a in zip(initial_mu_flat, after_mu_flat)
         )
-        
-        assert any_changed, "Optimizer state should change after update"
+        assert mu_changed, "Momentum estimates should change after update"
 
     def test_frozen_nonlora_skips_bias_updates(self, small_param, es_key):
         """
@@ -313,9 +323,21 @@ class TestUpdateMechanics:
         The update formula includes sqrt(N) scaling for population size.
         
         CODE: return -(new_grad * jnp.sqrt(fitnesses.size)).astype(param.dtype)
+        
+        This means: with same normalized fitnesses per-capita, larger populations
+        produce larger updates (scaled by sqrt(N)).
         """
-        # Test with different population sizes
-        for num_envs in [8, 32, 128]:
+        # Use identical normalized fitness patterns (just repeated)
+        # If we have [+1, -1, +1, -1, ...] normalized, the gradient estimate is
+        # sum_i normalized_i * perturbation_i, then scaled by sqrt(N)
+        
+        # Create a simple fitness pattern: alternating high/low
+        # This ensures after normalization we get consistent per-perturbation contribution
+        
+        update_magnitudes = []
+        population_sizes = [8, 32, 128]
+        
+        for num_envs in population_sizes:
             frozen_noiser_params, noiser_params = EggRoll.init_noiser(
                 {"w": small_param},
                 eggroll_config["sigma"],
@@ -325,8 +347,10 @@ class TestUpdateMechanics:
             )
             
             iterinfos = make_iterinfo(num_envs)
-            # Create fitnesses that would produce similar normalized values
-            fitnesses = jnp.linspace(0, 1, num_envs)
+            
+            # Create alternating fitnesses: high for +sigma threads, low for -sigma
+            # This creates a consistent gradient signal direction
+            fitnesses = jnp.array([1.0 if i % 2 == 0 else 0.0 for i in range(num_envs)])
             normalized = EggRoll.convert_fitnesses(frozen_noiser_params, noiser_params, fitnesses)
             
             es_tree_key = {"w": es_key}
@@ -338,5 +362,30 @@ class TestUpdateMechanics:
                 normalized, iterinfos, es_map
             )
             
-            # Just verify it runs without error for various population sizes
-            assert new_params["w"].shape == small_param.shape
+            # Compute update magnitude
+            update_magnitude = float(jnp.sqrt(jnp.mean((new_params["w"] - small_param) ** 2)))
+            update_magnitudes.append(update_magnitude)
+        
+        # The sqrt(N) scaling means:
+        # update_32 / update_8 ≈ sqrt(32/8) = 2
+        # update_128 / update_32 ≈ sqrt(128/32) = 2
+        # 
+        # But the number of perturbations also affects the gradient estimate variance,
+        # so we just verify the trend: larger populations should give larger updates
+        # when the fitness pattern is consistent.
+        
+        assert update_magnitudes[1] > update_magnitudes[0], \
+            f"Pop 32 update ({update_magnitudes[1]:.6f}) should exceed pop 8 ({update_magnitudes[0]:.6f})"
+        assert update_magnitudes[2] > update_magnitudes[1], \
+            f"Pop 128 update ({update_magnitudes[2]:.6f}) should exceed pop 32 ({update_magnitudes[1]:.6f})"
+        
+        # Verify approximate sqrt(N) scaling (with tolerance for noise)
+        ratio_32_8 = update_magnitudes[1] / update_magnitudes[0]
+        ratio_128_32 = update_magnitudes[2] / update_magnitudes[1]
+        expected_ratio = 2.0  # sqrt(4) = 2
+        
+        # Allow 50% tolerance due to different perturbation sets
+        assert 1.0 < ratio_32_8 < 4.0, \
+            f"Ratio 32/8 = {ratio_32_8:.2f} should be roughly sqrt(4)=2"
+        assert 1.0 < ratio_128_32 < 4.0, \
+            f"Ratio 128/32 = {ratio_128_32:.2f} should be roughly sqrt(4)=2"

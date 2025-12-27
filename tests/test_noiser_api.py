@@ -200,6 +200,10 @@ class TestNoiserBehaviorEquivalence:
     def test_fitness_normalization_matches_across_noisers(self, small_param):
         """
         Fitness normalization should produce identical results across noisers.
+        
+        Both EggRoll and OpenES should use the same baseline subtraction and
+        variance normalization. This test verifies they agree AND that the
+        result has the expected statistical properties.
         """
         raw_scores = jnp.array([1.0, 3.0, 5.0, 7.0, 2.0, 4.0, 6.0, 8.0])
         
@@ -214,8 +218,17 @@ class TestNoiserBehaviorEquivalence:
             )
             normalized_results.append(normalized)
         
+        # Both should agree
         assert jnp.allclose(normalized_results[0], normalized_results[1]), \
             "Fitness normalization should be identical"
+        
+        # AND they should have the correct statistical properties
+        for i, result in enumerate(normalized_results):
+            noiser_name = ["EggRoll", "OpenES"][i]
+            assert jnp.abs(jnp.mean(result)) < 1e-5, \
+                f"{noiser_name} normalization should have zero mean"
+            assert jnp.abs(jnp.var(result) - 1.0) < 0.1, \
+                f"{noiser_name} normalization should have unit variance"
 
 
 class TestBaseNoiserContract:
