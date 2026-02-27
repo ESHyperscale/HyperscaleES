@@ -1,10 +1,11 @@
+from collections import defaultdict
 import jax
 import optax
 import jax.numpy as jnp
+from jax.tree_util import tree_flatten, tree_unflatten
 from .base_noiser import Noiser
 
 from functools import partial
-
 import optax
 
 def get_lora_update_params(frozen_noiser_params, base_sigma, iterinfo, param, key):
@@ -59,7 +60,7 @@ def _noop_update(base_sigma, param, key, scores, iterinfo, frozen_noiser_params)
 
 class EggRoll(Noiser):
     @classmethod
-    def init_noiser(cls, params, sigma, lr, *args, solver=None, solver_kwargs=None, group_size=0, freeze_nonlora=False, noise_reuse=0, rank=1, **kwargs):
+    def init_noiser(cls, params, sigma, lr, *args, solver=None, solver_kwargs=None, group_size=0, freeze_nonlora=False, noise_reuse=0, rank=1, use_batched_update: bool = False, **kwargs):
         """
         Return frozen_noiser_params and noiser_params
         """
@@ -70,7 +71,7 @@ class EggRoll(Noiser):
         true_solver = solver(lr, **solver_kwargs)
         opt_state = true_solver.init(params)
         
-        return {"group_size": group_size, "freeze_nonlora": freeze_nonlora, "noise_reuse": noise_reuse, "solver": true_solver, "rank": rank}, {"sigma": sigma, "opt_state": opt_state}
+        return {"group_size": group_size, "freeze_nonlora": freeze_nonlora, "noise_reuse": noise_reuse, "solver": true_solver, "rank": rank, "use_batched_update": use_batched_update}, {"sigma": sigma, "opt_state": opt_state}
     
     @classmethod
     def do_mm(cls, frozen_noiser_params, noiser_params, param, base_key, iterinfo, x):
@@ -125,7 +126,57 @@ class EggRoll(Noiser):
         return -(new_grad * jnp.sqrt(fitnesses.size)).astype(param.dtype)
 
     @classmethod
-    def do_updates(cls, frozen_noiser_params, noiser_params, params, base_keys, fitnesses, iterinfos, es_map):
+    def do_updates(cls, frozen_noiser_params, noiser_params, params, base_keys, fitnesses, iterinfos, es_map):    
+        if frozen_noiser_params["use_batched_update"]:
+            return cls._do_updates_batched(frozen_noiser_params, noiser_params, params, base_keys, fitnesses, iterinfos, es_map)
+        else:
+            return cls._do_updates_original(frozen_noiser_params, noiser_params, params, base_keys, fitnesses, iterinfos, es_map)
+
+    @classmethod
+    def _do_updates_original(cls, frozen_noiser_params, noiser_params, params, base_keys, fitnesses, iterinfos, es_map):
         new_grad = jax.tree.map(lambda p, k, m: cls._do_update(p, k, fitnesses, iterinfos, m, noiser_params["sigma"], frozen_noiser_params), params, base_keys, es_map)
+        updates, noiser_params["opt_state"] = frozen_noiser_params["solver"].update(new_grad, noiser_params["opt_state"], params)
+        return noiser_params, optax.apply_updates(params, updates)
+    
+    @classmethod
+    def _do_updates_batched(cls, frozen_noiser_params, noiser_params, params, base_keys, fitnesses, iterinfos, es_map):
+        """This performs the update, but does so in a clever batched way, so that we do not end up having a python for loop over over every single weight matrix.
+                Instead, matrices that have the same shape are batched together, so that we vmap the update from these in one go, thereby making the XLA compiler's life much easier
+                This should make compilation for large models significantly faster.
+        """
+        
+        # Flatten all elements from the params, keys and map pytrees
+        flat_params, treedef = tree_flatten(params)
+        flat_keys, _ = tree_flatten(base_keys)
+        flat_es, _ = tree_flatten(es_map)
+        
+        # Group param matrices based on (a) their shape and (b) which update fn (full or lora) they use
+        buckets = defaultdict(list)
+        for i, (param, map_class) in enumerate(zip(flat_params, flat_es)):
+            key = param.shape, map_class
+            buckets[key].append(i)
+
+        # Fill these grads as we go through the batched process
+        new_flat_grads = [None] * len(flat_params)
+
+        # Process each bucket in a batched way instead of separately
+        for (_, map_class), indices in buckets.items():
+            # makes arrays of shape (num_arrays_of_this_shape, w, h)
+            batched_params = jnp.stack([flat_params[i] for i in indices])
+            batched_keys = jnp.stack([flat_keys[i] for i in indices])
+
+            # we vmap only over the param and rng, and nothing else
+            grads_for_this_batch = jax.vmap(
+                lambda param, rng: cls._do_update(param, rng, fitnesses, iterinfos, map_class, noiser_params["sigma"], frozen_noiser_params),
+            )(batched_params, batched_keys)
+            
+            # 4. Unstack back into the flat list
+            for i, idx in enumerate(indices):
+                new_flat_grads[idx] = grads_for_this_batch[i]
+
+        # unflatten back into the original pytree def
+        new_grad = tree_unflatten(treedef, new_flat_grads)
+        
+        # and do the updates
         updates, noiser_params["opt_state"] = frozen_noiser_params["solver"].update(new_grad, noiser_params["opt_state"], params)
         return noiser_params, optax.apply_updates(params, updates)
